@@ -13,11 +13,7 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import {
-  getLowLevelServer,
-  isJsonRpcError,
-  JSON_RPC_METHOD_NOT_FOUND,
-} from '../mcp/server-internals.js';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { logger } from './logger.js';
 
 /**
@@ -106,11 +102,15 @@ export interface CreateMessageResponse {
   stopReason?: 'endTurn' | 'stopSequence' | 'maxTokens';
 }
 
+function getLowLevelServer(server: McpServer): Server {
+  return (server as unknown as { server: Server }).server;
+}
+
 /**
  * Request LLM sampling from the client.
  *
- * This allows servers to implement agentic behaviors by asking the client
- * to call an LLM on their behalf.
+ * Uses the public server.createMessage() API which handles Zod schema
+ * validation internally — avoids the _zod errors from raw request().
  *
  * @param server - The MCP server instance
  * @param request - Sampling request parameters
@@ -149,43 +149,21 @@ export async function requestSampling(
   });
 
   try {
-    // Access the underlying server to send client requests
     const lowLevel = getLowLevelServer(server);
 
-    if (!lowLevel.request) {
-      throw new Error(
-        'Sampling not supported: Server does not support client requests',
-      );
-    }
+    const params = {
+      messages: request.messages,
+      maxTokens: request.maxTokens,
+      modelPreferences: request.modelPreferences,
+      systemPrompt: request.systemPrompt,
+      temperature: request.temperature,
+      stopSequences: request.stopSequences,
+      metadata: request.metadata,
+      ...(request.tools && { tools: request.tools }),
+      ...(request.toolChoice && { toolChoice: request.toolChoice }),
+    };
 
-    // Check for tools capability if tools or toolChoice are specified
-    // Per review finding #6: toolChoice CAN be specified without tools array
-    if (request.tools || request.toolChoice) {
-      const clientCapabilities = lowLevel.getClientCapabilities?.() ?? {};
-      const sampling = clientCapabilities.sampling as { tools?: boolean } | undefined;
-      if (!sampling?.tools) {
-        throw new Error(
-          'Client does not support sampling tools capability. ' +
-            'Client must declare "sampling.tools" to use tools or toolChoice.',
-        );
-      }
-    }
-
-    // Send sampling/createMessage request to client
-    const response = (await lowLevel.request({
-      method: 'sampling/createMessage',
-      params: {
-        messages: request.messages,
-        maxTokens: request.maxTokens,
-        modelPreferences: request.modelPreferences,
-        systemPrompt: request.systemPrompt,
-        temperature: request.temperature,
-        stopSequences: request.stopSequences,
-        metadata: request.metadata,
-        tools: request.tools,
-        toolChoice: request.toolChoice,
-      },
-    })) as CreateMessageResponse;
+    const response = await lowLevel.createMessage(params as Parameters<typeof lowLevel.createMessage>[0]);
 
     logger.info('sampling', {
       message: 'Received LLM response from client',
@@ -193,19 +171,12 @@ export async function requestSampling(
       stopReason: response.stopReason,
     });
 
-    return response;
+    return response as CreateMessageResponse;
   } catch (error) {
     logger.error('sampling', {
       message: 'Sampling request failed',
       error: (error as Error).message,
     });
-
-    // Check if client doesn't support sampling
-    if (isJsonRpcError(error, JSON_RPC_METHOD_NOT_FOUND)) {
-      throw new Error(
-        'Sampling not supported by client. Client must declare "sampling" capability.',
-      );
-    }
 
     throw error;
   }

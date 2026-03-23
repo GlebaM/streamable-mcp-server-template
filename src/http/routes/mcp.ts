@@ -4,8 +4,7 @@
 import { randomUUID } from 'node:crypto';
 import type { HttpBindings } from '@hono/node-server';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { toFetchResponse, toReqRes } from 'fetch-to-node';
+import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { Hono } from 'hono';
 import { config } from '../../config/env.js';
 import { authContextStorage, contextRegistry } from '../../core/context.js';
@@ -58,23 +57,18 @@ function resolveSessionApiKey(authContext?: AuthContext): string {
 
 export function buildMcpRoutes(params: {
   server: McpServer;
-  transports: Map<string, StreamableHTTPServerTransport>;
+  transports: Map<string, WebStandardStreamableHTTPServerTransport>;
 }) {
   const { server, transports } = params;
   const app = new Hono<{ Bindings: HttpBindings }>();
   const sessionStore = getSessionStore();
 
-  // Track which transports have been connected to avoid duplicate connect() calls
-  const connectedTransports = new WeakSet<StreamableHTTPServerTransport>();
+  const connectedTransports = new WeakSet<WebStandardStreamableHTTPServerTransport>();
 
   const MCP_SESSION_HEADER = 'Mcp-Session-Id';
 
-  /**
-   * Connect transport to server only if not already connected.
-   * McpServer.connect() should be called once per transport lifecycle.
-   */
   async function ensureConnected(
-    transport: StreamableHTTPServerTransport,
+    transport: WebStandardStreamableHTTPServerTransport,
   ): Promise<void> {
     if (!connectedTransports.has(transport)) {
       await server.connect(transport);
@@ -82,8 +76,12 @@ export function buildMcpRoutes(params: {
     }
   }
 
-  app.post('/', async (c) => {
-    const { req, res } = toReqRes(c.req.raw);
+  /**
+   * Shared handler for all HTTP methods. Since WebStandardStreamableHTTPServerTransport
+   * accepts a standard Request and returns a standard Response, we pass c.req.raw
+   * directly — no toReqRes/toFetchResponse shim needed.
+   */
+  async function handleMcpRequest(c: import('hono').Context<{ Bindings: HttpBindings }>) {
     let requestId: string | number | undefined;
 
     try {
@@ -105,7 +103,9 @@ export function buildMcpRoutes(params: {
           ? (initMessage?.params as { protocolVersion?: string }).protocolVersion
           : undefined;
 
-      if (!isInitialize && !sessionIdHeader) {
+      const method = c.req.method;
+
+      if (method === 'POST' && !isInitialize && !sessionIdHeader) {
         return c.json(
           {
             jsonrpc: '2.0',
@@ -116,8 +116,17 @@ export function buildMcpRoutes(params: {
         );
       }
 
-      // Server always generates session ID on initialize (per MCP spec)
-      // Ignore client-provided session ID to prevent session fixation
+      if ((method === 'GET' || method === 'DELETE') && !sessionIdHeader) {
+        return c.json(
+          {
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Method not allowed - no session' },
+            id: null,
+          },
+          405,
+        );
+      }
+
       const plannedSid = isInitialize ? randomUUID() : undefined;
       const sessionId = plannedSid ?? sessionIdHeader;
 
@@ -144,8 +153,6 @@ export function buildMcpRoutes(params: {
         }
       }
 
-      // Warn if API key changed but don't reject - allows legitimate re-auth scenarios
-      // Session stays bound to original API key for limit enforcement
       if (sessionId && !isInitialize && existingSession?.apiKey && existingSession.apiKey !== apiKey) {
         void logger.warning('mcp_session', {
           message: 'Request API key differs from session binding',
@@ -171,8 +178,7 @@ export function buildMcpRoutes(params: {
         sessionId,
         isInitialize,
         hasSessionIdHeader: !!sessionIdHeader,
-        hasAuthorizationHeader: !!req.headers.authorization,
-        requestMethod: req.method,
+        requestMethod: method,
         bodyMethod: messages[0]?.method,
       });
 
@@ -184,11 +190,10 @@ export function buildMcpRoutes(params: {
           }
           return c.text('Invalid session', 404);
         }
-        const created = new StreamableHTTPServerTransport({
+        const created = new WebStandardStreamableHTTPServerTransport({
           sessionIdGenerator: () => sessionId as string,
           onsessioninitialized: async (sid: string) => {
             transports.set(sid, created);
-            // Create session record AFTER SDK accepts initialize (prevents orphans)
             try {
               await sessionStore.create(sid, apiKey);
               if (protocolVersion) {
@@ -221,13 +226,11 @@ export function buildMcpRoutes(params: {
         });
       };
 
-      // Extract requestId from body if present
       requestId =
         body && typeof body === 'object' && 'id' in body
           ? (body.id as string | number)
           : undefined;
 
-      // Create request context (used by both registry and AsyncLocalStorage)
       const requestContext: RequestContext = {
         sessionId: plannedSid ?? sessionIdHeader,
         cancellationToken: createCancellationToken(),
@@ -241,7 +244,6 @@ export function buildMcpRoutes(params: {
         rsToken: authContext?.rsToken,
       };
 
-      // Store in registry for legacy lookup by requestId
       if (requestId) {
         contextRegistry.create(requestId, plannedSid ?? sessionIdHeader, {
           authStrategy: authContext?.strategy,
@@ -255,31 +257,29 @@ export function buildMcpRoutes(params: {
 
       await ensureConnected(transport);
 
-      // Run transport handling within AsyncLocalStorage context
-      // This makes auth context available to tool handlers via getCurrentAuthContext()
-      await authContextStorage.run(requestContext, async () => {
-        await transport.handleRequest(req, res, body);
-      });
+      const response = await authContextStorage.run(requestContext, () =>
+        transport.handleRequest(c.req.raw, { parsedBody: body }),
+      );
 
-      // Event-driven cleanup: delete context when response closes
-      res.on('close', () => {
-        if (requestId !== undefined) {
-          contextRegistry.delete(requestId);
-          void logger.debug('mcp', {
-            message: 'Request context cleaned up',
-            requestId,
-          });
-        }
-      });
+      if (method === 'DELETE') {
+        const cleanedCount = contextRegistry.deleteBySession(sessionIdHeader!);
+        void logger.info('mcp', {
+          message: 'Session terminated, contexts cleaned up',
+          sessionId: sessionIdHeader,
+          cleanedContexts: cleanedCount,
+        });
+        transports.delete(sessionIdHeader!);
+        transport.close();
+        await sessionStore.delete(sessionIdHeader!).catch(() => {});
+      }
 
-      return toFetchResponse(res);
+      return response;
     } catch (error) {
-      // Cleanup on error as well
       if (requestId !== undefined) {
         contextRegistry.delete(requestId);
       }
       void logger.error('mcp', {
-        message: 'Error handling POST request',
+        message: 'Error handling request',
         error: (error as Error).message,
       });
       return c.json(
@@ -291,129 +291,11 @@ export function buildMcpRoutes(params: {
         500,
       );
     }
-  });
+  }
 
-  app.get('/', async (c) => {
-    const { req, res } = toReqRes(c.req.raw);
-    const sessionIdHeader = c.req.header(MCP_SESSION_HEADER);
-    if (!sessionIdHeader) {
-      return c.json(
-        {
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Method not allowed - no session' },
-          id: null,
-        },
-        405,
-      );
-    }
-    try {
-      let sessionRecord: Awaited<ReturnType<typeof sessionStore.get>> | null = null;
-      try {
-        sessionRecord = await sessionStore.get(sessionIdHeader);
-      } catch (error) {
-        void logger.warning('mcp_session', {
-          message: 'Session lookup failed',
-          error: (error as Error).message,
-        });
-      }
-      if (!sessionRecord) {
-        const staleTransport = transports.get(sessionIdHeader);
-        if (staleTransport) {
-          transports.delete(sessionIdHeader);
-          staleTransport.close();
-        }
-        return c.text('Invalid session', 404);
-      }
-
-      const transport = transports.get(sessionIdHeader);
-      if (!transport) {
-        return c.text('Invalid session', 404);
-      }
-      await ensureConnected(transport);
-      await transport.handleRequest(req, res);
-      return toFetchResponse(res);
-    } catch (error) {
-      void logger.error('mcp', {
-        message: 'Error handling GET request',
-        error: (error as Error).message,
-      });
-      return c.json(
-        {
-          jsonrpc: '2.0',
-          error: { code: -32603, message: 'Internal server error' },
-          id: null,
-        },
-        500,
-      );
-    }
-  });
-
-  app.delete('/', async (c) => {
-    const { req, res } = toReqRes(c.req.raw);
-    const sessionIdHeader = c.req.header(MCP_SESSION_HEADER);
-    if (!sessionIdHeader) {
-      return c.json(
-        {
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Method not allowed - no session' },
-          id: null,
-        },
-        405,
-      );
-    }
-    try {
-      let sessionRecord: Awaited<ReturnType<typeof sessionStore.get>> | null = null;
-      try {
-        sessionRecord = await sessionStore.get(sessionIdHeader);
-      } catch (error) {
-        void logger.warning('mcp_session', {
-          message: 'Session lookup failed',
-          error: (error as Error).message,
-        });
-      }
-      if (!sessionRecord) {
-        const staleTransport = transports.get(sessionIdHeader);
-        if (staleTransport) {
-          transports.delete(sessionIdHeader);
-          staleTransport.close();
-        }
-        return c.text('Invalid session', 404);
-      }
-
-      const transport = transports.get(sessionIdHeader);
-      if (!transport) {
-        return c.text('Invalid session', 404);
-      }
-      await ensureConnected(transport);
-      await transport.handleRequest(req, res);
-
-      // Clean up all contexts for this session before closing
-      const cleanedCount = contextRegistry.deleteBySession(sessionIdHeader);
-      void logger.info('mcp', {
-        message: 'Session terminated, contexts cleaned up',
-        sessionId: sessionIdHeader,
-        cleanedContexts: cleanedCount,
-      });
-
-      transports.delete(sessionIdHeader);
-      transport.close();
-      await sessionStore.delete(sessionIdHeader).catch(() => {});
-      return toFetchResponse(res);
-    } catch (error) {
-      void logger.error('mcp', {
-        message: 'Error handling DELETE request',
-        error: (error as Error).message,
-      });
-      return c.json(
-        {
-          jsonrpc: '2.0',
-          error: { code: -32603, message: 'Internal server error' },
-          id: null,
-        },
-        500,
-      );
-    }
-  });
+  app.post('/', handleMcpRequest);
+  app.get('/', handleMcpRequest);
+  app.delete('/', handleMcpRequest);
 
   return app;
 }

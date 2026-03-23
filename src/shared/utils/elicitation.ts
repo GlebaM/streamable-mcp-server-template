@@ -16,9 +16,13 @@
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { z } from 'zod';
-import { getLowLevelServer } from '../mcp/server-internals.js';
 import { logger } from './logger.js';
+
+function getLowLevelServer(server: McpServer): Server {
+  return (server as unknown as { server: Server }).server;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Schema Types
@@ -285,25 +289,18 @@ export async function elicitForm(
   try {
     const lowLevel = getLowLevelServer(server);
 
-    if (!lowLevel.request) {
-      throw new Error('Server does not support client requests');
-    }
-
-    const response = (await lowLevel.request({
-      method: 'elicitation/create',
-      params: {
-        mode: 'form',
-        message: request.message,
-        requestedSchema: request.requestedSchema,
-      },
-    })) as ElicitResult;
+    const response = await lowLevel.elicitInput({
+      mode: 'form',
+      message: request.message,
+      requestedSchema: request.requestedSchema,
+    } as Parameters<typeof lowLevel.elicitInput>[0]);
 
     logger.info('elicitation', {
       message: 'Form elicitation completed',
       action: response.action,
     });
 
-    return response;
+    return response as ElicitResult;
   } catch (error) {
     logger.error('elicitation', {
       message: 'Form elicitation failed',
@@ -350,19 +347,12 @@ export async function elicitUrl(
   try {
     const lowLevel = getLowLevelServer(server);
 
-    if (!lowLevel.request) {
-      throw new Error('Server does not support client requests');
-    }
-
-    const response = (await lowLevel.request({
-      method: 'elicitation/create',
-      params: {
-        mode: 'url',
-        message: request.message,
-        elicitationId: request.elicitationId,
-        url: request.url,
-      },
-    })) as ElicitResult;
+    const response = await lowLevel.elicitInput({
+      mode: 'url',
+      message: request.message,
+      elicitationId: request.elicitationId,
+      url: request.url,
+    } as Parameters<typeof lowLevel.elicitInput>[0]);
 
     logger.info('elicitation', {
       message: 'URL elicitation completed',
@@ -370,7 +360,7 @@ export async function elicitUrl(
       elicitationId: request.elicitationId,
     });
 
-    return response;
+    return response as ElicitResult;
   } catch (error) {
     logger.error('elicitation', {
       message: 'URL elicitation failed',
@@ -399,11 +389,8 @@ export async function notifyElicitationComplete(
 
   try {
     const lowLevel = getLowLevelServer(server);
-
-    await lowLevel.notification?.({
-      method: 'notifications/elicitation/complete',
-      params: { elicitationId },
-    });
+    const notifyComplete = lowLevel.createElicitationCompletionNotifier(elicitationId);
+    await notifyComplete();
 
     logger.info('elicitation', {
       message: 'Elicitation complete notification sent',
